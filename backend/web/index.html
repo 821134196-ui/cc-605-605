@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>门店折扣码泄露封禁与订单追溯</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand">🛡️ 折扣码风控台</div>
+    <nav class="tabs">
+      <button v-for="t in tabs" :key="t.key"
+              :class="{active: tab===t.key}" @click="tab=t.key">{{ t.label }}</button>
+    </nav>
+  </header>
+
+  <main class="content">
+    <!-- ============ 结账下单 ============ -->
+    <section v-if="tab==='checkout'">
+      <h2>结账下单</h2>
+      <div class="grid2">
+        <div class="card">
+          <h3>① 选择会员与商品</h3>
+          <label>会员
+            <select v-model.number="cart.member_id">
+              <option v-for="m in members" :value="m.id">{{ m.name }}（{{ levelName(m.level) }}）</option>
+            </select>
+          </label>
+          <table class="tbl">
+            <thead><tr><th>商品</th><th>单价</th><th>数量</th></tr></thead>
+            <tbody>
+              <tr v-for="p in products" :key="p.id">
+                <td>{{ p.name }}</td>
+                <td>¥{{ fen(p.price_fen) }}</td>
+                <td><input type="number" min="0" max="99" v-model.number="cart.qty[p.id]" /></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h3>② 折扣码与核价</h3>
+          <label>折扣码（明文仅在结账时输入，列表不展示）
+            <input v-model="cart.code" placeholder="如 NEWBIE-5K2L-0001" />
+          </label>
+          <div class="btns">
+            <button class="ghost" @click="doQuote">核价预览</button>
+            <button @click="doCreate">生成待付款单</button>
+          </div>
+          <div v-if="quote" class="quote" :class="{bad: quote.reason}">
+            <template v-if="quote.reason">核价拒绝：<b>{{ reasonName(quote.reason) }}</b>，按原价结算</template>
+            <template v-else>优惠 <b>-¥{{ fen(quote.discount_fen) }}</b>，可享受折扣</template>
+          </div>
+
+          <h3 style="margin-top:18px">③ 支付核销</h3>
+          <template v-if="currentOrder">
+            <div class="orderbox" :class="currentOrder.status">
+              <div>单号 <b>{{ currentOrder.order_no }}</b>
+                <span class="tag" :class="currentOrder.status">{{ statusName(currentOrder.status) }}</span></div>
+              <div class="amounts">
+                <span>商品合计 ¥{{ fen(currentOrder.goods_total_fen) }}</span>
+                <span class="disc">优惠 -¥{{ fen(currentOrder.discount_fen) }}</span>
+                <span class="pay">应付 ¥{{ fen(currentOrder.pay_fen) }}</span>
+              </div>
+            </div>
+            <label>支付回执号（留空=本地模拟；填相同号可验证重复回执幂等）
+              <input v-model="payReceipt" placeholder="RC…（可留空）" />
+            </label>
+            <div class="btns">
+              <button :disabled="currentOrder.status!=='pending'" @click="doPay">提交支付回执</button>
+              <button class="ghost" @click="showOrder(currentOrder)">查看订单详情快照</button>
+            </div>
+          </template>
+          <p v-else class="hint">先生成一笔待付款订单。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 折扣码管理 ============ -->
+    <section v-if="tab==='codes'">
+      <h2>折扣码管理</h2>
+      <div class="card">
+        <div class="row-between">
+          <div>
+            批次：
+            <select v-model.number="codeFilter" @change="loadCodes">
+              <option :value="0">全部批次</option>
+              <option v-for="b in batches" :value="b.id">{{ b.name }}（{{ b.code_count }} 个码）</option>
+            </select>
+          </div>
+          <button class="danger" @click="banBatch">整批封禁（模拟泄露）</button>
+        </div>
+        <table class="tbl">
+          <thead><tr>
+            <th>ID</th><th>所属批次</th><th>码尾号</th><th>规则</th><th>有效期</th><th>状态</th><th>封禁原因</th><th>核销订单</th><th>操作</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="c in codes" :key="c.id">
+              <td>{{ c.id }}</td>
+              <td>{{ c.batch_name }}</td>
+              <td class="mono">{{ c.code_tail }}</td>
+              <td>{{ ruleText(c) }}</td>
+              <td class="small">{{ fmt(c.valid_from) }}<br/>~ {{ fmt(c.valid_until) }}</td>
+              <td><span class="tag" :class="c.status">{{ codeStatus(c.status) }}</span></td>
+              <td class="small">{{ c.ban_reason || '—' }}</td>
+              <td class="mono">{{ c.order_no || '—' }}</td>
+              <td>
+                <button v-if="c.status!=='banned'" class="danger sm" @click="banOne(c)">封禁</button>
+                <button v-else class="sm" @click="unbanOne(c)">误封恢复</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="hint">普通列表只显示尾号；已核销（redeemed）的码无法恢复，恢复仅限仍在有效期且未使用的码。</p>
+      </div>
+    </section>
+
+    <!-- ============ 订单 ============ -->
+    <section v-if="tab==='orders'">
+      <h2>订单追溯</h2>
+      <div class="grid2">
+        <div class="card">
+          <h3>订单列表</h3>
+          <button class="ghost sm" @click="loadOrders">刷新</button>
+          <table class="tbl">
+            <thead><tr><th>单号</th><th>会员</th><th>商品额</th><th>优惠</th><th>实付</th><th>状态</th><th>核销时间</th></tr></thead>
+            <tbody>
+              <tr v-for="o in orders" :key="o.order_no" @click="showOrder(o)"
+                  :class="{sel: detail && detail.order_no===o.order_no}">
+                <td class="mono">{{ o.order_no }}</td>
+                <td>{{ o.member_name }}</td>
+                <td>¥{{ fen(o.goods_total_fen) }}</td>
+                <td class="disc">-¥{{ fen(o.discount_fen) }}</td>
+                <td>¥{{ fen(o.pay_fen) }}</td>
+                <td><span class="tag" :class="o.status">{{ statusName(o.status) }}</span></td>
+                <td class="small">{{ o.redeemed_at ? fmt(o.redeemed_at) : '—' }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card" v-if="detail">
+          <h3>订单详情 · 金额快照</h3>
+          <div class="kv"><span>单号</span><b class="mono">{{ detail.order_no }}</b></div>
+          <div class="kv"><span>会员</span><b>{{ detail.member_name }}</b></div>
+          <div class="kv"><span>状态</span><span class="tag" :class="detail.status">{{ statusName(detail.status) }}</span></div>
+          <table class="tbl">
+            <thead><tr><th>商品</th><th>单价</th><th>数量</th><th>小计</th></tr></thead>
+            <tbody>
+              <tr v-for="(it,i) in detail.items" :key="i">
+                <td>{{ it.name }}</td><td>¥{{ fen(it.price_fen) }}</td><td>{{ it.qty }}</td>
+                <td>¥{{ fen(it.line_total_fen) }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="amounts big">
+            <span>商品合计 ¥{{ fen(detail.goods_total_fen) }}</span>
+            <span class="disc">优惠 -¥{{ fen(detail.discount_fen) }}</span>
+            <span class="pay">实付 ¥{{ fen(detail.pay_fen) }}</span>
+          </div>
+          <div v-if="detail.promo" class="snapshot">
+            <h4>采用的优惠规则快照（封禁后仍保留）</h4>
+            <div class="kv"><span>码尾号</span><b class="mono">{{ detail.promo.code_tail }}</b></div>
+            <div class="kv"><span>批次</span><b>{{ detail.promo.batch_name }}</b></div>
+            <div class="kv"><span>规则</span><b>{{ snapRule(detail.promo) }}</b></div>
+            <div class="kv"><span>实际优惠金额</span><b class="disc">-¥{{ fen(detail.promo.discount_fen) }}</b></div>
+            <div class="kv"><span>核销时间</span><b>{{ fmt(detail.promo.applied_at) }}</b></div>
+          </div>
+          <div v-else class="hint">该订单未使用折扣（或为封禁后重新核价的待付款单）。</div>
+          <div class="kv" v-if="detail.repriced_count">
+            <span>重新核价次数</span><b>{{ detail.repriced_count }}</b>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 影响清单 ============ -->
+    <section v-if="tab==='impact'">
+      <h2>泄露影响清单</h2>
+      <div class="card">
+        <button class="ghost sm" @click="loadImpact">刷新</button>
+        <p class="hint">已付款订单保留当时确认的优惠，不因事后封禁改变；下列每一笔都可追到原优惠规则与金额。</p>
+        <table class="tbl">
+          <thead><tr>
+            <th>单号</th><th>会员</th><th>码尾号</th><th>批次</th>
+            <th>核销时间</th><th>封禁时间</th><th>封禁原因</th>
+            <th>原优惠</th><th>实付快照</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="r in impact" :key="r.order_no">
+              <td class="mono">{{ r.order_no }}</td>
+              <td>{{ r.member_name }}</td>
+              <td class="mono">{{ r.code_tail }}</td>
+              <td>{{ r.batch_name }}</td>
+              <td class="small">{{ fmt(r.redeemed_at) }}</td>
+              <td class="small">{{ fmt(r.banned_at) }}</td>
+              <td class="small">{{ r.ban_reason }}</td>
+              <td class="disc">-¥{{ fen(r.promo ? r.promo.discount_fen : r.discount_fen) }}
+                <div class="small" v-if="r.promo">{{ snapRule(r.promo) }} @ {{ fmt(r.promo.applied_at) }}</div>
+              </td>
+              <td>¥{{ fen(r.pay_fen) }}</td>
+            </tr>
+            <tr v-if="!impact.length"><td colspan="9" class="hint">暂无受影响的已付款订单。</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <div v-if="toast" class="toast" :class="toastKind">{{ toast }}</div>
+</div>
+<script src="/vendor/vue.global.prod.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
