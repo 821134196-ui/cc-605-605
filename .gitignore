@@ -13,3 +13,12 @@ build/
 轨迹/
 录屏/
 视频/
+
+# Go build output
+/bin/
+# SQLite data
+/data/*.db
+/data/*.db-*
+# Embedded frontend build output（由 run.sh 构建生成）
+/cmd/server/web/index.html
+/cmd/server/web/assets/
